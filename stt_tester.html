@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Persian Whisper STT — WebSocket Tester</title>
+<style>
+  :root { --bg:#0f1117; --card:#1a1d27; --accent:#4f8cff; --text:#e4e6f0; --muted:#8a8fa6; }
+  * { box-sizing: border-box; margin:0; padding:0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
+         display:flex; justify-content:center; padding:32px 16px; min-height:100vh; }
+  .card { background:var(--card); border-radius:16px; padding:28px 32px; width:100%; max-width:720px;
+          box-shadow:0 12px 40px rgba(0,0,0,.45); }
+  h1 { font-size:1.35rem; margin-bottom:4px; color:var(--accent); }
+  .sub { font-size:.85rem; color:var(--muted); margin-bottom:20px; }
+  label { font-size:.8rem; color:var(--muted); display:block; margin-top:14px; margin-bottom:5px; }
+  input, select { width:100%; padding:10px 12px; border:1px solid #2c2f3e; border-radius:8px;
+                 background:#12141c; color:var(--text); font-size:.95rem; }
+  .row { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:180px; }
+  button { margin-top:18px; padding:11px 22px; border:none; border-radius:8px; font-size:.95rem;
+          cursor:pointer; font-weight:600; transition:opacity .15s; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #connectBtn { background:var(--accent); color:#fff; }
+  #streamBtn { background:#34d399; color:#06100e; }
+  #stopBtn  { background:#f87171; color:#fff; display:none; }
+  #clearBtn { background:#333; color:#ccc; margin-left:8px; }
+  #status { margin-top:12px; font-size:.85rem; color:var(--muted); }
+  #status.connected { color:#34d399; }
+  #status.error     { color:#f87171; }
+  .panel { margin-top:18px; border-radius:10px; background:#12141c; padding:14px 16px; min-height:100px;
+           border:1px solid #2c2f3e; overflow:auto; font-size:.9rem; }
+  .panel:empty::before { content:attr(data-placeholder); color:#555; }
+  .msg { padding:4px 0; border-bottom:1px dashed #222; word-break:break-word; }
+  .msg .ts { color:#555; font-size:.75rem; margin-right:8px; }
+  .transcript { font-size:1.15rem; color:#e6e9f5; margin-top:10px; white-space:pre-wrap; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:99px; font-size:.72rem; margin-left:6px;
+           vertical-align:middle; }
+  .badge.fa  { background:#7c3aed22; color:#a78bfa; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🗣 Persian Whisper STT</h1>
+  <p class="sub">Stream audio over WebSocket to the Whisper Persian microservice</p>
+
+  <div class="row">
+    <div>
+      <label for="token">Bearer Token</label>
+      <input id="token" type="text" placeholder="wsp_xxxx… (from `python -m app.cli create-token`)" />
+    </div>
+    <div>
+      <label for="lang">Language</label>
+      <select id="lang">
+        <option value="fa" selected>fa (Persian)</option>
+        <option value="fa-IR">fa-IR</option>
+        <option value="en">en</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label for="sample">Load Sample Audio</label>
+      <select id="sample">
+        <option value="">— none —</option>
+        <option value="sample_fa.mp3">sample_fa.mp3</option>
+        <option value="sample_fa.wav">sample_fa.wav</option>
+      </select>
+    </div>
+    <div style="flex:0">
+      <label>&nbsp;</label>
+      <div style="display:flex; gap:8px;">
+        <button id="connectBtn">Connect</button>
+        <button id="streamBtn" disabled>▶ Stream</button>
+        <button id="stopBtn">■ Stop</button>
+        <button id="clearBtn">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="status">Disconnected</div>
+
+  <div class="panel" id="logPanel" data-placeholder="Log messages will appear here…"></div>
+  <div class="panel">
+    <div style="color:var(--muted); font-size:.8rem;">Transcription</div>
+    <div class="transcript" id="transcript"></div>
+  </div>
+</div>
+
+<script>
+/* ── helpers ── */
+const $ = id => document.getElementById(id);
+const log    = $('logPanel');
+const status = $('status');
+const streamBtn = $('streamBtn');
+const connectBtn = $('connectBtn');
+const stopBtn = $('stopBtn');
+const clearBtn = $('clearBtn');
+const transcript = $('transcript');
+
+let ws = null;
+let micStream = null;
+let recorder = null;
+let audioChunks = [];
+
+function ts() { return new Date().toLocaleTimeString('en-GB', {hour12:false}); }
+function appendLog(text, kind='info') {
+  const d = document.createElement('div');
+  d.className = 'msg';
+  d.innerHTML = `<span class="ts">[${ts()}]</span> ${text}`;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+function setStatus(txt, kind='') { status.textContent = txt; status.className = kind; }
+function appendTranscript(html) { transcript.innerHTML += html; }
+
+/* ── connect / disconnect ── */
+function connect() {
+  const token = $('token').value.trim();
+  const lang  = $('lang').value;
+  if (!token) { alert('Paste your bearer token'); return; }
+  ws = new WebSocket(`ws://localhost:8000/api/v1/stream?token=${encodeURIComponent(token)}&language=${lang}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('🟢 Connected', 'connected');
+    connectBtn.disabled = true;
+    streamBtn.disabled = false;
+    appendLog(`Connected to ${ws.url}`);
+  };
+
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.ready)      { appendLog(`Server ready — language=${d.language}`); }
+        else if (d.buffered_bytes != null) { appendLog(`Buffered: ${d.buffered_bytes} bytes`); }
+        else if (d.text && d.segments) { appendLog(`Final text (${d.language}, ${d.duration?.toFixed(1)}s):`, 'transcript'); appendTranscript(d.text); }
+        else if (d.error) { appendLog(`ERROR: ${d.error}`, 'error'); }
+        else { appendLog(JSON.stringify(d)); }
+      } catch (_) { appendLog(String(e.data)); }
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('🔴 Disconnected');
+    connectBtn.disabled = false; streamBtn.disabled = true; stopRecording();
+    appendLog('Connection closed');
+  };
+
+  ws.onerror = err => { setStatus('⚠ Error', 'error'); appendLog('Socket error — check token & server'); };
+}
+
+/* ── send finalize ── */
+function finalize() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ eof: true }));
+  appendLog('Sent finalize →');
+}
+function clearTranscript() { transcript.innerHTML = ''; log.innerHTML = ''; }
+
+/* ── microphone streaming ── */
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    recorder = new MediaRecorder(micStream, { mimeType:'audio/webm' });
+    audioChunks = [];
+
+    recorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(audioChunks, { type:'audio/webm' });
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (ws?.readyState === WebSocket.OPEN) ws.send(reader.result);
+      };
+      reader.readAsArrayBuffer(blob);
+    };
+    recorder.start(500);          // push chunks every 500 ms
+    appendLog('🎤 Microphone streaming started (chunk every 500 ms)');
+  } catch (err) {
+    appendLog(`Mic error: ${err.message}`, 'error');
+  }
+}
+
+function stopMic() {
+  if (recorder && recorder.state !== 'inactive') { recorder.stop(); }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); }
+  micStream = null; recorder = null;
+  appendLog('Mic stopped.');
+}
+
+/* ── file streaming ── */
+async function streamFile(file) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const buf = await file.arrayBuffer();
+  const CHUNK = 32768;
+  for (let i = 0; i < buf.byteLength; i += CHUNK) {
+    ws.send(buf.slice(i, i + CHUNK));
+    await new Promise(r => setTimeout(r, 20));   // ~50 kbps throttle
+  }
+  appendLog(`Sent ${(buf.byteLength/1024).toFixed(1)} KB →`);
+  finalize();
+}
+
+/* ── wire buttons ── */
+connectBtn.onclick   = connect;
+
+streamBtn.onclick = async () => {
+  if (!ws) return;
+  const sel = $('sample').value;
+  if (sel) {
+    const resp = await fetch(sel);
+    const blob = await resp.blob();
+    await streamFile(new File([blob], sel, { type:blob.type }));
+  } else {
+    await startMic();
+    // after 6 s of silence-ish recording, finalize
+    setTimeout(finalize, 6000);
+    setTimeout(stopMic, 7000);
+  }
+};
+
+stopBtn.onclick = () => { stopMic(); finalize(); };
+clearBtn.onclick = clearTranscript;
+</script>
+</body>
+</html>
