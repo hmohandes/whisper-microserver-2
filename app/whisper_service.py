@@ -7,11 +7,11 @@ import whisper
 from .config import settings
 
 
-_model: whisper.model.WHISPER | None = None
+_model: Any = None
 _lock = threading.Lock()
 
 
-def get_model() -> whisper.model.WHISPER:
+def get_model() -> Any:
     global _model
     if _model is None:
         with _lock:
